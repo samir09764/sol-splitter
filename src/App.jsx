@@ -11,7 +11,7 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 // Jupiter deprecated the old quote-api.jup.ag/v6 endpoints — using the
 // current free lite-api endpoints instead.
 const JUP_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote";
-const JUP_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap";
+const JUP_SWAP_INSTRUCTIONS_API = "https://lite-api.jup.ag/swap/v1/swap-instructions";
 
 function shortAddr(a) {
   if (!a) return "";
@@ -161,27 +161,29 @@ export default function SolSplitter() {
         return;
       }
 
-      // --- Build swap transactions ------------------------------------
+      // --- Build swap INSTRUCTIONS (not full transactions) so we can merge
+      // multiple tokens into a single transaction -----------------------
       setPhase("building");
-      pushLog("Requesting swap transactions from Jupiter…");
+      pushLog("Requesting swap instructions from Jupiter…");
 
-      const swapTxs = [];
+      const web3 = await importWeb3();
+      const { VersionedTransaction, TransactionMessage, PublicKey, ComputeBudgetProgram } = web3;
+
+      const built = [];
       for (const { row, quote } of quotes) {
         try {
-          const res = await fetch(JUP_SWAP_API, {
+          const res = await fetch(JUP_SWAP_INSTRUCTIONS_API, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               quoteResponse: quote,
               userPublicKey: wallet.publicKey,
               wrapAndUnwrapSol: true,
-              dynamicComputeUnitLimit: true,
-              prioritizationFeeLamports: "auto",
             }),
           });
           const data = await res.json();
           if (data.error) throw new Error(data.error);
-          swapTxs.push({ row, swapTransaction: data.swapTransaction });
+          built.push({ row, data });
           updateRow(row.id, { status: "built" });
         } catch (e) {
           updateRow(row.id, { status: "error", error: e.message || String(e) });
@@ -189,57 +191,153 @@ export default function SolSplitter() {
         }
       }
 
-      if (swapTxs.length === 0) {
-        pushLog("Could not build any swap transactions.", "error");
+      if (built.length === 0) {
+        pushLog("Could not build any swap instructions.", "error");
         setPhase("error");
         return;
       }
 
-      // Jupiter returns one fully-formed VersionedTransaction per swap.
-      // Solana's transaction size cap means we generally cannot merge
-      // Jupiter's own serialized transactions into a single tx client-side
-      // without re-deriving instructions — so this app sends each Jupiter
-      // swap as its own transaction, but batches them tightly, one right
-      // after another with no user delay, and reports a single combined
-      // outcome. This is the practical, reliable approach: Jupiter's own
-      // routing already changes per token (different pools, hop counts),
-      // which is what actually prevents a guaranteed single-transaction
-      // merge for an arbitrary set of 10 tokens.
-      setBatches(swapTxs.map((s) => ({ mint: s.row.mint, symbol: s.row.symbol })));
+      // Try to combine tokens into as few transactions as possible.
+      // Start at MAX_BATCH per transaction; if a batch is too large to fit
+      // Solana's size/compute limit, automatically split that batch smaller
+      // and retry — so a swap never fails outright just because the batch
+      // size was too optimistic.
+      const MAX_BATCH = 5;
+
+      function buildGroupTx(group, blockhash) {
+        const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })];
+        const lookupTablePromises = [];
+        const seenLuts = new Set();
+
+        for (const { data } of group) {
+          (data.setupInstructions || []).forEach((ix) => ixs.push(toIx(ix)));
+          if (data.swapInstruction) ixs.push(toIx(data.swapInstruction));
+          if (data.cleanupInstruction) ixs.push(toIx(data.cleanupInstruction));
+          for (const addr of data.addressLookupTableAddresses || []) {
+            if (!seenLuts.has(addr)) {
+              seenLuts.add(addr);
+              lookupTablePromises.push(addr);
+            }
+          }
+        }
+        return { ixs, lutAddrs: lookupTablePromises };
+      }
+
+      async function tryCompile(group, blockhash) {
+        const { ixs, lutAddrs } = buildGroupTx(group, blockhash);
+        const lookupTables = [];
+        for (const addr of lutAddrs) {
+          const lut = await conn.getAddressLookupTable(new PublicKey(addr));
+          if (lut.value) lookupTables.push(lut.value);
+        }
+        const msg = new TransactionMessage({
+          payerKey: new PublicKey(wallet.publicKey),
+          recentBlockhash: blockhash,
+          instructions: ixs,
+        }).compileToV0Message(lookupTables);
+        const vtx = new VersionedTransaction(msg);
+        // Solana's hard cap is 1232 bytes for the serialized transaction.
+        const size = vtx.serialize().length;
+        if (size > 1232) throw new Error(`transaction too large (${size} bytes)`);
+        return vtx;
+      }
+
+      // Helper: turn Jupiter's instruction JSON into a web3.js TransactionInstruction
+      function toIx(ix) {
+        return new web3.TransactionInstruction({
+          programId: new PublicKey(ix.programId),
+          keys: ix.accounts.map((a) => ({
+            pubkey: new PublicKey(a.pubkey),
+            isSigner: a.isSigner,
+            isWritable: a.isWritable,
+          })),
+          data: Buffer.from(ix.data, "base64"),
+        });
+      }
+
+      const conn = new web3.Connection("https://api.mainnet-beta.solana.com", "confirmed");
+      const { blockhash } = await conn.getLatestBlockhash("finalized");
+
+      // Recursively try a batch at decreasing sizes until it compiles, or
+      // fall back to one-per-transaction if nothing else fits.
+      async function resolveGroup(items) {
+        if (items.length === 0) return [];
+        try {
+          const vtx = await tryCompile(items, blockhash);
+          return [{ rows: items.map((g) => g.row), tx: vtx }];
+        } catch (e) {
+          if (items.length === 1) throw e; // can't split further
+          const mid = Math.ceil(items.length / 2);
+          const left = await resolveGroup(items.slice(0, mid));
+          const right = await resolveGroup(items.slice(mid));
+          return [...left, ...right];
+        }
+      }
+
+      const initialGroups = [];
+      for (let i = 0; i < built.length; i += MAX_BATCH) {
+        initialGroups.push(built.slice(i, i + MAX_BATCH));
+      }
+      pushLog(`Trying to combine ${built.length} token swap(s) into as few transactions as possible (up to ${MAX_BATCH} per tx)…`);
+
+      const groupTxs = [];
+      for (const group of initialGroups) {
+        try {
+          const resolved = await resolveGroup(group);
+          resolved.forEach((g) => {
+            groupTxs.push(g);
+            g.rows.forEach((row) => updateRow(row.id, { status: "built" }));
+          });
+          if (resolved.length > 1) {
+            pushLog(`A batch of ${group.length} didn't fit in one transaction — split into ${resolved.length}.`, "info");
+          }
+        } catch (e) {
+          group.forEach(({ row }) =>
+            updateRow(row.id, { status: "error", error: `Could not build even as a single swap: ${e.message || e}` })
+          );
+          pushLog(`Batch failed entirely: ${e.message || e}`, "error");
+        }
+      }
+
+      if (groupTxs.length === 0) {
+        pushLog("Could not build any combined transactions.", "error");
+        setPhase("error");
+        return;
+      }
+
+      setBatches(groupTxs.map((g) => ({ mints: g.rows.map((r) => r.mint) })));
 
       setPhase("signing");
-      pushLog(`Ready to sign ${swapTxs.length} transaction(s). Your wallet will prompt for each.`);
+      pushLog(`Ready to sign ${groupTxs.length} transaction(s) covering ${built.length} token(s). Your wallet will prompt for each.`);
 
       const sigs = [];
-      for (const { row, swapTransaction } of swapTxs) {
+      for (const { rows: groupRows, tx } of groupTxs) {
         try {
-          updateRow(row.id, { status: "signing" });
-          const txBuffer = Uint8Array.from(atob(swapTransaction), (c) => c.charCodeAt(0));
+          groupRows.forEach((row) => updateRow(row.id, { status: "signing" }));
 
-          // Prefer wallet's signAndSendTransaction if available (Phantom/Solflare both support it)
           let signature;
           if (wallet.provider.signAndSendTransaction) {
-            const { VersionedTransaction } = await importWeb3();
-            const vtx = VersionedTransaction.deserialize(txBuffer);
-            const result = await wallet.provider.signAndSendTransaction(vtx);
+            const result = await wallet.provider.signAndSendTransaction(tx);
             signature = result.signature || result;
           } else {
-            const { VersionedTransaction } = await importWeb3();
-            const vtx = VersionedTransaction.deserialize(txBuffer);
-            const signed = await wallet.provider.signTransaction(vtx);
-            // Without a direct RPC connection configured, ask the wallet to relay it.
+            const signed = await wallet.provider.signTransaction(tx);
             signature = await wallet.provider.request?.({
               method: "sendTransaction",
               params: [signed.serialize()],
             });
           }
 
-          sigs.push({ mint: row.mint, signature });
-          updateRow(row.id, { status: "done" });
-          pushLog(`Sent: ${shortAddr(row.mint)} → tx ${shortAddr(signature)}`, "success");
+          groupRows.forEach((row) => {
+            sigs.push({ mint: row.mint, signature });
+            updateRow(row.id, { status: "done" });
+          });
+          pushLog(
+            `Sent batch of ${groupRows.length} token(s) (${groupRows.map((r) => shortAddr(r.mint)).join(", ")}) → tx ${shortAddr(signature)}`,
+            "success"
+          );
         } catch (e) {
-          updateRow(row.id, { status: "error", error: e.message || String(e) });
-          pushLog(`Sign/send failed for ${shortAddr(row.mint)}: ${e.message || e}`, "error");
+          groupRows.forEach((row) => updateRow(row.id, { status: "error", error: e.message || String(e) }));
+          pushLog(`Sign/send failed for batch (${groupRows.map((r) => shortAddr(r.mint)).join(", ")}): ${e.message || e}`, "error");
         }
       }
 
@@ -247,8 +345,8 @@ export default function SolSplitter() {
       setPhase(sigs.length > 0 ? "done" : "error");
       pushLog(
         sigs.length === validRows.length
-          ? `All ${sigs.length} swaps sent successfully.`
-          : `${sigs.length}/${validRows.length} swaps sent. Check the log for failures.`,
+          ? `All ${validRows.length} token swap(s) sent across ${groupTxs.length} transaction(s).`
+          : `${sigs.length}/${validRows.length} swaps sent across ${groupTxs.length} transaction(s). Check the log for failures.`,
         sigs.length === validRows.length ? "success" : "error"
       );
     } catch (e) {
@@ -407,11 +505,11 @@ export default function SolSplitter() {
 
         {/* Reality-check notice */}
         <div className="bg-[#1A1508] border border-[#3D2E0A] rounded-xl p-4 mb-4 text-xs text-[#D6B85C] leading-relaxed">
-          Solana caps transaction size and compute per transaction, and each token can route through a
-          different set of pools. So this tool cannot promise all swaps merge into one transaction — it
-          builds the best quote and route per token, then sends each as its own transaction back-to-back,
-          with no manual steps in between. The fee is the standard per-transaction network fee each time,
-          typically a fraction of a cent on Solana.
+          This app tries to combine up to 5 token swaps into a single transaction, so the network fee is
+          paid once per batch, not once per token. If a batch doesn't fit Solana's per-transaction size
+          limit (this depends on how complex each token's swap route is), it automatically splits into
+          smaller batches until it fits — so the swap still completes, just across a couple more
+          transactions than the ideal case.
         </div>
 
         {/* Action */}

@@ -364,9 +364,25 @@ export default function SolSplitter() {
     }
   }
 
-  // Lazy-load @solana/web3.js from CDN once, since this artifact has no bundler.
+  // Lazy-load a Buffer polyfill and @solana/web3.js from CDN once, since
+  // this artifact has no bundler and @solana/web3.js expects Node's Buffer
+  // to exist as a global even in the browser.
   async function importWeb3() {
     if (window.solanaWeb3) return window.solanaWeb3;
+
+    if (!window.Buffer) {
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = "https://unpkg.com/buffer@6.0.3/index.js";
+        script.onload = () => {
+          window.Buffer = window.buffer.Buffer;
+          resolve();
+        };
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    }
+
     await new Promise((resolve, reject) => {
       const script = document.createElement("script");
       script.src = "https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js";

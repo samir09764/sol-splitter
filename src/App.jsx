@@ -255,7 +255,7 @@ export default function SolSplitter() {
         });
       }
 
-      const conn = new web3.Connection("https://api.mainnet-beta.solana.com", "confirmed");
+      const conn = new web3.Connection("https://solana-rpc.publicnode.com", "confirmed");
       const { blockhash } = await conn.getLatestBlockhash("finalized");
 
       // Recursively try a batch at decreasing sizes until it compiles, or

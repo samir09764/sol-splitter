@@ -47,6 +47,7 @@ export default function SolSplitter() {
   const [wallet, setWallet] = useState(null); // { publicKey, provider, label }
   const [connecting, setConnecting] = useState(false);
   const [solAmount, setSolAmount] = useState("0.5");
+  const [destWallet, setDestWallet] = useState("");
   const [rows, setRows] = useState(() =>
     Array.from({ length: 4 }, () => emptyRow())
   );
@@ -188,14 +189,18 @@ export default function SolSplitter() {
       const built = [];
       for (const { row, quote } of quotes) {
         try {
+          const body = {
+            quoteResponse: quote,
+            userPublicKey: wallet.publicKey,
+            wrapAndUnwrapSol: true,
+          };
+          if (destWallet.trim()) {
+            body.destinationWallet = destWallet.trim();
+          }
           const res = await fetchWithTimeout(JUP_SWAP_INSTRUCTIONS_API, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              quoteResponse: quote,
-              userPublicKey: wallet.publicKey,
-              wrapAndUnwrapSol: true,
-            }),
+            body: JSON.stringify(body),
           });
           const data = await res.json();
           if (data.error) throw new Error(data.error);
@@ -533,6 +538,24 @@ export default function SolSplitter() {
                 {(bps / 100).toFixed(1)}%
               </button>
             ))}
+          </div>
+
+          <div className="mt-4 pt-4 border-t border-[#1E232B]">
+            <label className="text-xs font-medium text-[#8B92A0] uppercase tracking-wide">
+              Destination wallet <span className="normal-case text-[#4A5160]">(optional — leave blank to receive in your own wallet)</span>
+            </label>
+            <input
+              value={destWallet}
+              onChange={(e) => setDestWallet(e.target.value)}
+              placeholder="Recipient's Solana wallet address"
+              className="mt-2 w-full bg-[#0B0E11] border border-[#262B33] rounded-lg px-4 py-2.5 text-sm font-mono text-[#D5D8DD] focus:outline-none focus:border-[#8B5CF6] focus:ring-1 focus:ring-[#8B5CF6]"
+            />
+            {destWallet.trim() && (
+              <p className="mt-2 text-xs text-[#F5B942] flex items-center gap-1.5">
+                <AlertTriangle size={12} />
+                All swapped tokens will be sent to this address instead of your own wallet. Double-check it — sends are irreversible.
+              </p>
+            )}
           </div>
         </div>
 

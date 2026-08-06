@@ -22,6 +22,22 @@ function uid() {
   return Math.random().toString(36).slice(2, 9);
 }
 
+// Wraps fetch with a hard timeout so a slow/unresponsive endpoint fails
+// loudly instead of leaving the UI stuck on "Building transactions…".
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // A single row: a target mint + a weight (%). Weights are normalized to 100.
 function emptyRow() {
   return { id: uid(), mint: "", symbol: "", weight: 10, status: "idle", error: "" };
@@ -142,7 +158,7 @@ export default function SolSplitter() {
         updateRow(row.id, { status: "quoting" });
         try {
           const url = `${JUP_QUOTE_API}?inputMint=${SOL_MINT}&outputMint=${row.mint.trim()}&amount=${lamports}&slippageBps=${slippageBps}`;
-          const res = await fetch(url);
+          const res = await fetchWithTimeout(url);
           if (!res.ok) throw new Error(`quote HTTP ${res.status}`);
           const q = await res.json();
           if (q.error) throw new Error(q.error);
@@ -172,7 +188,7 @@ export default function SolSplitter() {
       const built = [];
       for (const { row, quote } of quotes) {
         try {
-          const res = await fetch(JUP_SWAP_INSTRUCTIONS_API, {
+          const res = await fetchWithTimeout(JUP_SWAP_INSTRUCTIONS_API, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -367,29 +383,32 @@ export default function SolSplitter() {
   // Lazy-load a Buffer polyfill and @solana/web3.js from CDN once, since
   // this artifact has no bundler and @solana/web3.js expects Node's Buffer
   // to exist as a global even in the browser.
+  function loadScript(src, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`Timed out loading ${src}`)), timeoutMs);
+      const script = document.createElement("script");
+      script.src = src;
+      script.onload = () => {
+        clearTimeout(t);
+        resolve();
+      };
+      script.onerror = () => {
+        clearTimeout(t);
+        reject(new Error(`Failed to load ${src}`));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
   async function importWeb3() {
     if (window.solanaWeb3) return window.solanaWeb3;
 
     if (!window.Buffer) {
-      await new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = "https://unpkg.com/buffer@6.0.3/index.js";
-        script.onload = () => {
-          window.Buffer = window.buffer.Buffer;
-          resolve();
-        };
-        script.onerror = reject;
-        document.head.appendChild(script);
-      });
+      await loadScript("https://unpkg.com/buffer@6.0.3/index.js");
+      window.Buffer = window.buffer.Buffer;
     }
 
-    await new Promise((resolve, reject) => {
-      const script = document.createElement("script");
-      script.src = "https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js";
-      script.onload = resolve;
-      script.onerror = reject;
-      document.head.appendChild(script);
-    });
+    await loadScript("https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js");
     return window.solanaWeb3;
   }
 

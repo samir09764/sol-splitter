@@ -404,8 +404,59 @@ export default function SolSplitter() {
     if (window.solanaWeb3) return window.solanaWeb3;
 
     if (!window.Buffer) {
-      await loadScript("https://unpkg.com/buffer@6.0.3/index.js");
-      window.Buffer = window.buffer.Buffer;
+      // Minimal Buffer polyfill — just enough of Node's Buffer API for
+      // @solana/web3.js to work in the browser, without depending on a
+      // CDN package whose export shape can vary.
+      class MinimalBuffer extends Uint8Array {
+        static from(data, encoding) {
+          if (typeof data === "string") {
+            if (encoding === "base64") {
+              const bin = atob(data);
+              const bytes = new MinimalBuffer(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              return bytes;
+            }
+            if (encoding === "hex") {
+              const bytes = new MinimalBuffer(data.length / 2);
+              for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(data.substr(i * 2, 2), 16);
+              return bytes;
+            }
+            const enc = new TextEncoder().encode(data);
+            return MinimalBuffer.from(enc);
+          }
+          const bytes = new MinimalBuffer(data.length || data.byteLength || 0);
+          bytes.set(data instanceof Uint8Array ? data : new Uint8Array(data));
+          return bytes;
+        }
+        static alloc(size) {
+          return new MinimalBuffer(size);
+        }
+        static isBuffer(obj) {
+          return obj instanceof MinimalBuffer;
+        }
+        static concat(list, totalLength) {
+          const len = totalLength ?? list.reduce((a, b) => a + b.length, 0);
+          const out = new MinimalBuffer(len);
+          let offset = 0;
+          for (const b of list) {
+            out.set(b, offset);
+            offset += b.length;
+          }
+          return out;
+        }
+        toString(encoding) {
+          if (encoding === "base64") {
+            let bin = "";
+            for (let i = 0; i < this.length; i++) bin += String.fromCharCode(this[i]);
+            return btoa(bin);
+          }
+          if (encoding === "hex") {
+            return Array.from(this).map((b) => b.toString(16).padStart(2, "0")).join("");
+          }
+          return new TextDecoder().decode(this);
+        }
+      }
+      window.Buffer = MinimalBuffer;
     }
 
     await loadScript("https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js");

@@ -242,6 +242,15 @@ export default function SolSplitter() {
         return vtx;
       }
 
+      // Helper: decode a base64 string into a Uint8Array without relying on
+      // Node's Buffer (not available in the browser).
+      function base64ToBytes(b64) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes;
+      }
+
       // Helper: turn Jupiter's instruction JSON into a web3.js TransactionInstruction
       function toIx(ix) {
         return new web3.TransactionInstruction({
@@ -251,7 +260,7 @@ export default function SolSplitter() {
             isSigner: a.isSigner,
             isWritable: a.isWritable,
           })),
-          data: Buffer.from(ix.data, "base64"),
+          data: base64ToBytes(ix.data),
         });
       }
 

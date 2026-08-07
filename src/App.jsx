@@ -163,7 +163,7 @@ export default function SolSplitter() {
           if (!res.ok) throw new Error(`quote HTTP ${res.status}`);
           const q = await res.json();
           if (q.error) throw new Error(q.error);
-          quotes.push({ row, lamports, quote: q });
+          quotes.push({ row, lamports, quote: q, outAmount: q.outAmount });
           updateRow(row.id, { status: "quoted" });
           pushLog(`Quote OK for ${shortAddr(row.mint)} (${row.weight}% → ${(lamports / 1e9).toFixed(4)} SOL)`, "success");
         } catch (e) {
@@ -185,18 +185,16 @@ export default function SolSplitter() {
 
       const web3 = await importWeb3();
       const { VersionedTransaction, TransactionMessage, PublicKey, ComputeBudgetProgram } = web3;
+      const conn = new web3.Connection("https://solana-rpc.publicnode.com", "confirmed");
 
       const built = [];
-      for (const { row, quote } of quotes) {
+      for (const { row, quote, outAmount } of quotes) {
         try {
           const body = {
             quoteResponse: quote,
             userPublicKey: wallet.publicKey,
             wrapAndUnwrapSol: true,
           };
-          if (destWallet.trim()) {
-            body.destinationWallet = destWallet.trim();
-          }
           const res = await fetchWithTimeout(JUP_SWAP_INSTRUCTIONS_API, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -204,7 +202,17 @@ export default function SolSplitter() {
           });
           const data = await res.json();
           if (data.error) throw new Error(data.error);
-          built.push({ row, data });
+
+          // If forwarding to a destination wallet, we need the token's
+          // decimals for a TransferChecked instruction — fetch once here.
+          let decimals = null;
+          if (destWallet.trim()) {
+            const mintInfo = await conn.getParsedAccountInfo(new PublicKey(row.mint.trim()));
+            decimals = mintInfo?.value?.data?.parsed?.info?.decimals ?? null;
+            if (decimals == null) throw new Error("could not read token decimals for transfer");
+          }
+
+          built.push({ row: { ...row, outAmount, decimals }, data });
           updateRow(row.id, { status: "built" });
         } catch (e) {
           updateRow(row.id, { status: "error", error: e.message || String(e) });
@@ -218,6 +226,57 @@ export default function SolSplitter() {
         return;
       }
 
+      // --- SPL Token program constants & instruction builders, needed to
+      // forward swapped tokens to a destination wallet in the same
+      // transaction (no extra library — built directly from the well-known
+      // Token Program layout). -------------------------------------------
+      const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+      const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+      const SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111111111112");
+
+      async function getAta(mint, owner) {
+        const [ata] = await PublicKey.findProgramAddress(
+          [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        return ata;
+      }
+
+      function createAtaIdempotentIx(payer, owner, mint, ata) {
+        // Instruction 1 = "CreateIdempotent" on the Associated Token Account program:
+        // safe to include even if the account already exists (no-op in that case).
+        return new web3.TransactionInstruction({
+          programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+          keys: [
+            { pubkey: payer, isSigner: true, isWritable: true },
+            { pubkey: ata, isSigner: false, isWritable: true },
+            { pubkey: owner, isSigner: false, isWritable: false },
+            { pubkey: mint, isSigner: false, isWritable: false },
+            { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+          ],
+          data: new Uint8Array([1]),
+        });
+      }
+
+      function transferCheckedIx(source, mint, destination, owner, amount, decimals) {
+        // Instruction 12 = TransferChecked on the Token program.
+        const data = new Uint8Array(10);
+        data[0] = 12;
+        new DataView(data.buffer).setBigUint64(1, BigInt(amount), true);
+        data[9] = decimals;
+        return new web3.TransactionInstruction({
+          programId: TOKEN_PROGRAM_ID,
+          keys: [
+            { pubkey: source, isSigner: false, isWritable: true },
+            { pubkey: mint, isSigner: false, isWritable: false },
+            { pubkey: destination, isSigner: false, isWritable: true },
+            { pubkey: owner, isSigner: true, isWritable: false },
+          ],
+          data,
+        });
+      }
+
       // Try to combine tokens into as few transactions as possible.
       // Start at MAX_BATCH per transaction; if a batch is too large to fit
       // Solana's size/compute limit, automatically split that batch smaller
@@ -225,12 +284,15 @@ export default function SolSplitter() {
       // size was too optimistic.
       const MAX_BATCH = 5;
 
-      function buildGroupTx(group, blockhash) {
+      async function buildGroupTx(group, blockhash) {
         const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })];
         const lookupTablePromises = [];
         const seenLuts = new Set();
 
-        for (const { data } of group) {
+        const destPubkey = destWallet.trim() ? new PublicKey(destWallet.trim()) : null;
+        const ownerPubkey = new PublicKey(wallet.publicKey);
+
+        for (const { data, row } of group) {
           (data.setupInstructions || []).forEach((ix) => ixs.push(toIx(ix)));
           if (data.swapInstruction) ixs.push(toIx(data.swapInstruction));
           if (data.cleanupInstruction) ixs.push(toIx(data.cleanupInstruction));
@@ -240,12 +302,21 @@ export default function SolSplitter() {
               lookupTablePromises.push(addr);
             }
           }
+
+          // Forward the swapped token to the destination wallet, if set.
+          if (destPubkey && row.decimals != null && row.outAmount != null) {
+            const mintPubkey = new PublicKey(row.mint.trim());
+            const sourceAta = await getAta(mintPubkey, ownerPubkey);
+            const destAta = await getAta(mintPubkey, destPubkey);
+            ixs.push(createAtaIdempotentIx(ownerPubkey, destPubkey, mintPubkey, destAta));
+            ixs.push(transferCheckedIx(sourceAta, mintPubkey, destAta, ownerPubkey, row.outAmount, row.decimals));
+          }
         }
         return { ixs, lutAddrs: lookupTablePromises };
       }
 
       async function tryCompile(group, blockhash) {
-        const { ixs, lutAddrs } = buildGroupTx(group, blockhash);
+        const { ixs, lutAddrs } = await buildGroupTx(group, blockhash);
         const lookupTables = [];
         for (const addr of lutAddrs) {
           const lut = await conn.getAddressLookupTable(new PublicKey(addr));
@@ -285,7 +356,6 @@ export default function SolSplitter() {
         });
       }
 
-      const conn = new web3.Connection("https://solana-rpc.publicnode.com", "confirmed");
       const { blockhash } = await conn.getLatestBlockhash("finalized");
 
       // Recursively try a batch at decreasing sizes until it compiles, or
@@ -553,7 +623,9 @@ export default function SolSplitter() {
             {destWallet.trim() && (
               <p className="mt-2 text-xs text-[#F5B942] flex items-center gap-1.5">
                 <AlertTriangle size={12} />
-                All swapped tokens will be sent to this address instead of your own wallet. Double-check it — sends are irreversible.
+                Swapped tokens will be sent to this address instead of your own wallet. If this wallet
+                has never held a given token before, a small one-time account rent (~0.002 SOL per new
+                token) is paid from your wallet. Double-check the address — sends are irreversible.
               </p>
             )}
           </div>

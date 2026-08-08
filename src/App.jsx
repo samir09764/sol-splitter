@@ -147,6 +147,18 @@ export default function SolSplitter() {
       pushLog("Enter a valid SOL amount.", "error");
       return;
     }
+    if (destWallet.trim()) {
+      try {
+        const web3check = await importWeb3();
+        new web3check.PublicKey(destWallet.trim());
+      } catch (e) {
+        pushLog(
+          `Destination wallet address is invalid — please check it for typos or extra characters. (${e.message || e})`,
+          "error"
+        );
+        return;
+      }
+    }
 
     try {
       setPhase("quoting");

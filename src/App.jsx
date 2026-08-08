@@ -247,12 +247,21 @@ export default function SolSplitter() {
       // --- SPL Token program constants & instruction builders, needed to
       // forward swapped tokens to a destination wallet in the same
       // transaction (no extra library — built directly from the well-known
-      // Token Program layout). -------------------------------------------
-      const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-      const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-      const SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111111111112");
+      // Token Program layout). Only constructed if a destination wallet is
+      // actually set, so normal (non-forwarding) swaps never touch this code.
+      let TOKEN_PROGRAM_ID = null;
+      let ASSOCIATED_TOKEN_PROGRAM_ID = null;
+      let SYSTEM_PROGRAM_ID = null;
+      function ensureTokenProgramIds() {
+        if (!TOKEN_PROGRAM_ID) {
+          TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+          ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+          SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111111111112");
+        }
+      }
 
       async function getAta(mint, owner) {
+        ensureTokenProgramIds();
         const [ata] = await PublicKey.findProgramAddress(
           [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
           ASSOCIATED_TOKEN_PROGRAM_ID
@@ -261,6 +270,7 @@ export default function SolSplitter() {
       }
 
       function createAtaIdempotentIx(payer, owner, mint, ata) {
+        ensureTokenProgramIds();
         // Instruction 1 = "CreateIdempotent" on the Associated Token Account program:
         // safe to include even if the account already exists (no-op in that case).
         return new web3.TransactionInstruction({
@@ -278,6 +288,7 @@ export default function SolSplitter() {
       }
 
       function transferCheckedIx(source, mint, destination, owner, amount, decimals) {
+        ensureTokenProgramIds();
         // Instruction 12 = TransferChecked on the Token program.
         const data = new Uint8Array(10);
         data[0] = 12;
@@ -315,7 +326,12 @@ export default function SolSplitter() {
             throw new Error(`destination wallet address "${destWallet.trim()}" is not a valid public key`);
           }
         }
-        const ownerPubkey = new PublicKey(wallet.publicKey);
+        let ownerPubkey;
+        try {
+          ownerPubkey = new PublicKey(wallet.publicKey.toString());
+        } catch (e) {
+          throw new Error(`could not read your wallet's public key: ${e.message || e}`);
+        }
 
         for (const { data, row } of group) {
           (data.setupInstructions || []).forEach((ix) => ixs.push(toIx(ix)));
@@ -348,7 +364,7 @@ export default function SolSplitter() {
           if (lut.value) lookupTables.push(lut.value);
         }
         const msg = new TransactionMessage({
-          payerKey: new PublicKey(wallet.publicKey),
+          payerKey: new PublicKey(wallet.publicKey.toString()),
           recentBlockhash: blockhash,
           instructions: ixs,
         }).compileToV0Message(lookupTables);

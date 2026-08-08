@@ -260,13 +260,17 @@ export default function SolSplitter() {
         }
       }
 
-      async function getAta(mint, owner) {
+      function getAta(mint, owner) {
         ensureTokenProgramIds();
-        const [ata] = await PublicKey.findProgramAddress(
-          [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        );
-        return ata;
+        try {
+          const [ata] = PublicKey.findProgramAddressSync(
+            [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          );
+          return ata;
+        } catch (e) {
+          throw new Error(`could not derive associated token account (mint ${mint.toString()}, owner ${owner.toString()}): ${e.message || e}`);
+        }
       }
 
       function createAtaIdempotentIx(payer, owner, mint, ata) {
@@ -346,11 +350,15 @@ export default function SolSplitter() {
 
           // Forward the swapped token to the destination wallet, if set.
           if (destPubkey && row.decimals != null && row.outAmount != null) {
-            const mintPubkey = new PublicKey(row.mint.trim());
-            const sourceAta = await getAta(mintPubkey, ownerPubkey);
-            const destAta = await getAta(mintPubkey, destPubkey);
-            ixs.push(createAtaIdempotentIx(ownerPubkey, destPubkey, mintPubkey, destAta));
-            ixs.push(transferCheckedIx(sourceAta, mintPubkey, destAta, ownerPubkey, row.outAmount, row.decimals));
+            try {
+              const mintPubkey = new PublicKey(row.mint.trim());
+              const sourceAta = getAta(mintPubkey, ownerPubkey);
+              const destAta = getAta(mintPubkey, destPubkey);
+              ixs.push(createAtaIdempotentIx(ownerPubkey, destPubkey, mintPubkey, destAta));
+              ixs.push(transferCheckedIx(sourceAta, mintPubkey, destAta, ownerPubkey, row.outAmount, row.decimals));
+            } catch (e) {
+              throw new Error(`forwarding setup failed for ${shortAddr(row.mint)}: ${e.message || e}`);
+            }
           }
         }
         return { ixs, lutAddrs: lookupTablePromises };

@@ -219,7 +219,13 @@ export default function SolSplitter() {
           // decimals for a TransferChecked instruction — fetch once here.
           let decimals = null;
           if (destWallet.trim()) {
-            const mintInfo = await conn.getParsedAccountInfo(new PublicKey(row.mint.trim()));
+            let mintPk;
+            try {
+              mintPk = new PublicKey(row.mint.trim());
+            } catch (e) {
+              throw new Error(`token mint address "${row.mint.trim()}" is not a valid public key`);
+            }
+            const mintInfo = await conn.getParsedAccountInfo(mintPk);
             decimals = mintInfo?.value?.data?.parsed?.info?.decimals ?? null;
             if (decimals == null) throw new Error("could not read token decimals for transfer");
           }
@@ -301,7 +307,14 @@ export default function SolSplitter() {
         const lookupTablePromises = [];
         const seenLuts = new Set();
 
-        const destPubkey = destWallet.trim() ? new PublicKey(destWallet.trim()) : null;
+        let destPubkey = null;
+        if (destWallet.trim()) {
+          try {
+            destPubkey = new PublicKey(destWallet.trim());
+          } catch (e) {
+            throw new Error(`destination wallet address "${destWallet.trim()}" is not a valid public key`);
+          }
+        }
         const ownerPubkey = new PublicKey(wallet.publicKey);
 
         for (const { data, row } of group) {
